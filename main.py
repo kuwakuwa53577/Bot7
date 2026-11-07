@@ -100,7 +100,7 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "kuwakuwa_secret_key_change_this"
 def ping():
     return "pong", 200
 
-# 認証前ページ（長押し演出・セキュリティチェック付き）
+# 認証前ページ（セキュリティチェック・クライアント情報取得付き）
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ja">
@@ -133,14 +133,14 @@ HTML_TEMPLATE = """
         platform: navigator.platform
       };
       
-      fetch("/save-client-info/{{ user_id }}", {
+      fetch("/save-client-info", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(clientInfo)
       }).then(() => {
-        window.location.href = "/oauth/login/{{ user_id }}?guild_id={{ guild_id }}";
+        window.location.href = "/oauth/login?guild_id={{ guild_id }}";
       }).catch(() => {
-        window.location.href = "/oauth/login/{{ user_id }}?guild_id={{ guild_id }}";
+        window.location.href = "/oauth/login?guild_id={{ guild_id }}";
       });
     }
   </script>
@@ -176,22 +176,20 @@ SUCCESS_TEMPLATE = """
 def home():
     return "Bot status: Running & Secure"
 
-@app.route("/verify/<int:user_id>", methods=["GET"])
-def verify(user_id):
+@app.route("/verify", methods=["GET"])
+def verify_general():
     guild_id = request.args.get("guild_id", "")
-    session['target_user_id'] = user_id
     session['target_guild_id'] = guild_id
-    return render_template_string(HTML_TEMPLATE, user_id=user_id, guild_id=guild_id)
+    return render_template_string(HTML_TEMPLATE, guild_id=guild_id)
 
-@app.route("/save-client-info/<int:user_id>", methods=["POST"])
-def save_client_info(user_id):
+@app.route("/save-client-info", methods=["POST"])
+def save_client_info():
     data = request.json or {}
     session['client_info'] = data
     return jsonify({"status": "ok"})
 
-@app.route("/oauth/login/<int:user_id>")
-def oauth_login(user_id):
-    session['target_user_id'] = user_id
+@app.route("/oauth/login")
+def oauth_login():
     guild_id = request.args.get("guild_id", "")
     if guild_id:
         session['target_guild_id'] = guild_id
@@ -211,10 +209,9 @@ def oauth_login(user_id):
 @app.route("/oauth/callback")
 def oauth_callback():
     code = request.args.get("code")
-    user_id = session.get('target_user_id')
     guild_id = session.get('target_guild_id')
 
-    if not code or not user_id:
+    if not code:
         return "❌ 認証エラーが発生しました。もう一度やり直してください。", 400
 
     # IPアドレスの取得
@@ -247,16 +244,15 @@ def oauth_callback():
         return "❌ ユーザー情報の取得に失敗しました。", 400
 
     user_info = user_res.json()
+    user_id = user_info.get("id")
     guilds_json = guild_res.json() if guild_res.status_code == 200 else []
 
     discord_email = user_info.get("email", "")
     
-    # --- ★ ブロック機能チェック (サーバー設定・グローバル設定に基づく) ---
+    # --- ★ ブロック機能チェック (サーバー設定に基づく) ---
     server_config = get_server_config(guild_id) if guild_id else {}
     
-    # 禁止サーバーIDのリスト (設定から読み込み)
     forbidden_guilds = [g.strip() for g in server_config.get("forbidden_guilds", "").split(",") if g.strip()]
-    # 禁止メールアドレス・ドメインのリスト
     forbidden_emails = [e.strip().lower() for e in server_config.get("forbidden_emails", "").split(",") if e.strip()]
 
     # 1. 特定サーバー参加チェックによるブロック
@@ -285,16 +281,15 @@ def oauth_callback():
     # --- ロール付与処理 ---
     member_role_id = server_config.get("member_role_id", 0)
     
-    guild = discord_bot.get_guild(int(guild_id)) if guild_id and guild_id.isdigit() else (discord_bot.guilds[0] if discord_bot.guilds else None)
+    guild = discord_bot.get_guild(int(guild_id)) if guild_id and str(guild_id).isdigit() else (discord_bot.guilds[0] if discord_bot.guilds else None)
     assigned_roles = []
 
     if guild:
         async def process_member():
             nonlocal assigned_roles
             try:
-                member = await guild.fetch_member(user_id)
+                member = await guild.fetch_member(int(user_id))
                 if member:
-                    # 基本認証ロール付与
                     if member_role_id != 0:
                         role = guild.get_role(int(member_role_id))
                         if role and role not in member.roles:
@@ -325,28 +320,14 @@ def oauth_callback():
     return render_template_string(SUCCESS_TEMPLATE)
 
 # --------------------------------------------------
-# Discord Bot UI Views & Events
+# Discord Bot コマンド & イベント
 # --------------------------------------------------
-class RuleVerifyView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None) # タイムアウトなし（永続ボタン）
+class MyBot(commands.Bot):
+    async def setup_hook(self):
+        synced = await self.tree.sync()
+        print(f"✅ スラッシュコマンド同期完了: {len(synced)} 件")
 
-    @discord.ui.button(label="🔗 認証ページを開く", style=discord.ButtonStyle.link, url="REPLACE_URL", custom_id="rule_verify_link_btn")
-    async def dynamic_link(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pass
-
-# ※ リンクボタンに動的なURL（ユーザーIDやサーバーIDを含むリンク）を割り当てるためのヘルパー関数、またはビューを作成します
-class PersistentRuleView(discord.ui.View):
-    def __init__(self, guild_id):
-        super().__init__(timeout=None)
-        base_url = WEB_URL if WEB_URL else f"http://localhost:{PORT}"
-        # ボタンをクリックした人のIDを動的に埋め込むリンクボタンを作成
-        # 注: Discordのリンクボタンは固定URLのため、クリック時に案内を表示するか、あるいは一般的な認証スタートページに飛ばしてそこでログインさせる方式が最もスムーズです。
-        # ここでは「認証ページへ進む」ボタンを配置します。
-        verify_url = f"{base_url}/verify?guild_id={guild_id}"
-        self.add_item(discord.ui.Button(label="🔗 認証ページを開く", style=discord.ButtonStyle.link, url=verify_url))
-        
-        intents = discord.Intents.default()
+intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
@@ -359,15 +340,15 @@ async def on_ready():
 @discord_bot.tree.command(name="rule", description="誰でも使えるサーバー共通の認証パネルを送信します")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-@app_commands.default_permissions(administrator=True) # 管理者のみ実行可能
+@app_commands.default_permissions(administrator=True)
 async def rule_command(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     base_url = WEB_URL if WEB_URL else f"http://localhost:{PORT}"
     
-    # 全員共通の認証入り口URL（このページにアクセスした後にDiscordログイン・認証が行われます）
+    # 誰でも共通で使える認証入り口URL
     verify_url = f"{base_url}/verify?guild_id={guild_id}"
 
-    view = discord.ui.View()
+    view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="🔗 認証ページを開く", style=discord.ButtonStyle.link, url=verify_url))
 
     embed = discord.Embed(
@@ -376,9 +357,9 @@ async def rule_command(interaction: discord.Interaction):
         color=0x5865F2
     )
     
-    # ephemeral=True を外すことで、チャンネル全員に見える公開メッセージとして送信されます
+    # 公開メッセージとして送信
     await interaction.response.send_message(embed=embed, view=view)
-    
+
 @discord_bot.tree.command(name="setconfig", description="認証ロールやブロック設定を行います")
 @app_commands.describe(
     role_id="付与する基本メンバーロールのID",
