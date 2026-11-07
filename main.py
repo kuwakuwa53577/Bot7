@@ -325,21 +325,28 @@ def oauth_callback():
     return render_template_string(SUCCESS_TEMPLATE)
 
 # --------------------------------------------------
-# Discord Bot コマンド & イベント
+# Discord Bot UI Views & Events
 # --------------------------------------------------
 class RuleVerifyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None) # タイムアウトなし（永続ボタン）
+
+    @discord.ui.button(label="🔗 認証ページを開く", style=discord.ButtonStyle.link, url="REPLACE_URL", custom_id="rule_verify_link_btn")
+    async def dynamic_link(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+# ※ リンクボタンに動的なURL（ユーザーIDやサーバーIDを含むリンク）を割り当てるためのヘルパー関数、またはビューを作成します
+class PersistentRuleView(discord.ui.View):
     def __init__(self, guild_id):
         super().__init__(timeout=None)
         base_url = WEB_URL if WEB_URL else f"http://localhost:{PORT}"
-        verify_url = f"{base_url}/verify/{guild_id}" # 実際は動的に生成
+        # ボタンをクリックした人のIDを動的に埋め込むリンクボタンを作成
+        # 注: Discordのリンクボタンは固定URLのため、クリック時に案内を表示するか、あるいは一般的な認証スタートページに飛ばしてそこでログインさせる方式が最もスムーズです。
+        # ここでは「認証ページへ進む」ボタンを配置します。
+        verify_url = f"{base_url}/verify?guild_id={guild_id}"
         self.add_item(discord.ui.Button(label="🔗 認証ページを開く", style=discord.ButtonStyle.link, url=verify_url))
-
-class MyBot(commands.Bot):
-    async def setup_hook(self):
-        synced = await self.tree.sync()
-        print(f"✅ スラッシュコマンド同期完了: {len(synced)} 件")
-
-intents = discord.Intents.default()
+        
+        intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
@@ -349,24 +356,29 @@ discord_bot = MyBot(command_prefix="!", intents=intents, proxy=PROXY_URL)
 async def on_ready():
     print(f"✅ Discord Bot 接続成功: {discord_bot.user}")
 
-@discord_bot.tree.command(name="rule", description="このサーバー用の認証パネルを送信します")
+@discord_bot.tree.command(name="rule", description="誰でも使えるサーバー共通の認証パネルを送信します")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.default_permissions(administrator=True) # 管理者のみ実行可能
 async def rule_command(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     base_url = WEB_URL if WEB_URL else f"http://localhost:{PORT}"
-    verify_url = f"{base_url}/verify/{interaction.user.id}?guild_id={guild_id}"
+    
+    # 全員共通の認証入り口URL（このページにアクセスした後にDiscordログイン・認証が行われます）
+    verify_url = f"{base_url}/verify?guild_id={guild_id}"
 
     view = discord.ui.View()
     view.add_item(discord.ui.Button(label="🔗 認証ページを開く", style=discord.ButtonStyle.link, url=verify_url))
 
     embed = discord.Embed(
-        title="🔒 サーバー認証",
-        description="下のボタンからウェブページにアクセスし、認証を完了させてください。",
+        title="🔒 サーバー認証パネル",
+        description="下のボタンをクリックして、Discordアカウントの認証およびセキュリティチェックを完了させてください。\n認証が完了すると、自動的にロールが付与されます。",
         color=0x5865F2
     )
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
+    
+    # ephemeral=True を外すことで、チャンネル全員に見える公開メッセージとして送信されます
+    await interaction.response.send_message(embed=embed, view=view)
+    
 @discord_bot.tree.command(name="setconfig", description="認証ロールやブロック設定を行います")
 @app_commands.describe(
     role_id="付与する基本メンバーロールのID",
