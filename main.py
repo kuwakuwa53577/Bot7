@@ -59,28 +59,28 @@ except Exception as e:
     print(f"⚠️ Firestoreクライアントの取得に失敗しました: {e}")
 
 # --------------------------------------------------
-# データベース設定ヘルパー（Firestoreでサーバー設定を動的管理）
+# データベース設定ヘルパー（サーバーごとの動的管理）
 # --------------------------------------------------
 def get_server_config(guild_id):
-    """Firestoreからサーバーごとの設定を取得する"""
-    if not db:
+    """Firestoreから特定のサーバーごとの設定を取得する"""
+    if not db or not guild_id:
         return {}
     try:
         doc = db.collection("server_configs").document(str(guild_id)).get()
         if doc.exists:
             return doc.to_dict()
     except Exception as e:
-        print(f"❌ 設定取得エラー: {e}")
+        print(f"❌ 設定取得エラー (Guild: {guild_id}): {e}")
     return {}
 
 def save_server_config(guild_id, config_dict):
-    """Firestoreへサーバーごとの設定を保存する"""
-    if not db:
+    """Firestoreへ特定のサーバーごとの設定を保存する"""
+    if not db or not guild_id:
         return
     try:
         db.collection("server_configs").document(str(guild_id)).set(config_dict, merge=True)
     except Exception as e:
-        print(f"❌ 設定保存エラー: {e}")
+        print(f"❌ 設定保存エラー (Guild: {guild_id}): {e}")
 
 def save_user_verification(user_id, data_dict):
     if not db:
@@ -100,7 +100,7 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "kuwakuwa_secret_key_change_this"
 def ping():
     return "pong", 200
 
-# 認証前ページ（セキュリティチェック・クライアント情報取得付き）
+# 認証前ページ
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ja">
@@ -148,7 +148,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# 認証完了画面
 SUCCESS_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ja">
@@ -174,12 +173,13 @@ SUCCESS_TEMPLATE = """
 
 @app.route("/")
 def home():
-    return "Bot status: Running & Secure"
+    return "Bot status: Running & Multi-Guild Secure"
 
 @app.route("/verify", methods=["GET"])
 def verify_general():
     guild_id = request.args.get("guild_id", "")
-    session['target_guild_id'] = guild_id
+    if guild_id:
+        session['target_guild_id'] = guild_id
     return render_template_string(HTML_TEMPLATE, guild_id=guild_id)
 
 @app.route("/save-client-info", methods=["POST"])
@@ -209,7 +209,8 @@ def oauth_login():
 @app.route("/oauth/callback")
 def oauth_callback():
     code = request.args.get("code")
-    guild_id = session.get('target_guild_id')
+    # セッションからサーバーIDを取得（なければリクエスト引数もフォールバック確認）
+    guild_id = session.get('target_guild_id') or request.args.get('guild_id', '')
 
     if not code:
         return "❌ 認証エラーが発生しました。もう一度やり直してください。", 400
@@ -249,7 +250,7 @@ def oauth_callback():
 
     discord_email = user_info.get("email", "")
     
-    # --- ★ ブロック機能チェック (サーバー設定に基づく) ---
+    # --- ★ 該当サーバーごとの個別ブロック機能チェック ---
     server_config = get_server_config(guild_id) if guild_id else {}
     
     forbidden_guilds = [g.strip() for g in server_config.get("forbidden_guilds", "").split(",") if g.strip()]
@@ -278,10 +279,10 @@ def oauth_callback():
         join_data = {"access_token": access_token}
         requests.put(join_url, headers=join_headers, json=join_data)
 
-    # --- ロール付与処理 ---
+    # --- 該当サーバー固有のロール付与処理 ---
     member_role_id = server_config.get("member_role_id", 0)
     
-    guild = discord_bot.get_guild(int(guild_id)) if guild_id and str(guild_id).isdigit() else (discord_bot.guilds[0] if discord_bot.guilds else None)
+    guild = discord_bot.get_guild(int(guild_id)) if guild_id and str(guild_id).isdigit() else None
     assigned_roles = []
 
     if guild:
@@ -296,7 +297,7 @@ def oauth_callback():
                             await member.add_roles(role)
                             assigned_roles.append(role.name)
             except Exception as e:
-                print(f"❌ ロール付与処理エラー: {e}")
+                print(f"❌ ロール付与処理エラー (Guild: {guild_id}): {e}")
 
         future = asyncio.run_coroutine_threadsafe(process_member(), discord_bot.loop)
         try:
@@ -311,6 +312,7 @@ def oauth_callback():
         "global_name": user_info.get("global_name"),
         "email": discord_email,
         "ip": ip_address,
+        "guild_id": guild_id,
         "guilds_count": len(guilds_json),
         "client_info": session.get('client_info', {}),
         "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -335,9 +337,9 @@ discord_bot = MyBot(command_prefix="!", intents=intents, proxy=PROXY_URL)
 
 @discord_bot.event
 async def on_ready():
-    print(f"✅ Discord Bot 接続成功: {discord_bot.user}")
+    print(f"✅ Discord Bot 接続成功: {discord_bot.user} (導入サーバー数: {len(discord_bot.guilds)}個)")
 
-@discord_bot.tree.command(name="rule", description="誰でも使えるサーバー共通の認証パネルを送信します")
+@discord_bot.tree.command(name="rule", description="このサーバー専用の認証パネルを送信します")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.default_permissions(administrator=True)
@@ -345,7 +347,7 @@ async def rule_command(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     base_url = WEB_URL if WEB_URL else f"http://localhost:{PORT}"
     
-    # 誰でも共通で使える認証入り口URL
+    # 実行されたサーバーのIDをURLに組み込むため、何個サーバーがあっても完全に個別認識されます
     verify_url = f"{base_url}/verify?guild_id={guild_id}"
 
     view = discord.ui.View(timeout=None)
@@ -353,18 +355,17 @@ async def rule_command(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title="🔒 サーバー認証パネル",
-        description="下のボタンをクリックして、Discordアカウントの認証およびセキュリティチェックを完了させてください。\n認証が完了すると、自動的にロールが付与されます。",
+        description="下のボタンをクリックして、Discordアカウントの認証およびセキュリティチェックを完了させてください。\n認証が完了すると、このサーバー専用のロールが自動的に付与されます。",
         color=0x5865F2
     )
     
-    # 公開メッセージとして送信
     await interaction.response.send_message(embed=embed, view=view)
 
-@discord_bot.tree.command(name="setconfig", description="認証ロールやブロック設定を行います")
+@discord_bot.tree.command(name="setconfig", description="このサーバー用の認証ロールやブロック設定を行います")
 @app_commands.describe(
-    role_id="付与する基本メンバーロールのID",
-    forbidden_guilds="ブロックするサーバーID (カンマ区切り)",
-    forbidden_emails="ブロックするメールドメイン/アドレス (カンマ区切り)"
+    role_id="このサーバーで付与する基本メンバーロールのID",
+    forbidden_guilds="このサーバーでブロックする参加禁止サーバーID (カンマ区切り)",
+    forbidden_emails="このサーバーでブロックするメールドメイン/アドレス (カンマ区切り)"
 )
 @app_commands.default_permissions(administrator=True)
 async def setconfig_command(interaction: discord.Interaction, role_id: str = "", forbidden_guilds: str = "", forbidden_emails: str = ""):
@@ -379,7 +380,7 @@ async def setconfig_command(interaction: discord.Interaction, role_id: str = "",
         config["forbidden_emails"] = forbidden_emails
         
     save_server_config(guild_id, config)
-    await interaction.response.send_message("✅ サーバーの認証・セキュリティ設定を更新しました！", ephemeral=True)
+    await interaction.response.send_message("✅ このサーバーの認証・セキュリティ設定を個別保存しました！", ephemeral=True)
 
 # --------------------------------------------------
 # メイン実行
